@@ -27,10 +27,10 @@ build:
       nuget install NUnit.Runners -Version 2.6.4 -OutputDirectory testrunner
 
       # Compile the driver and test code
-      xbuild /p:Configuration=Release /v:m /p:restorepackages=false src/Cassandra.sln
+      xbuild /p:Configuration=Debug /v:m /p:restorepackages=false src/Cassandra.sln
 
       # Run the tests
       echo "==========RUNNING FULL SUITE OF TESTS=========="
-      mono ./testrunner/NUnit.Runners.2.6.4/tools/nunit-console.exe src/Cassandra.Tests/bin/Release/Cassandra.Tests.dll src/Cassandra.IntegrationTests/bin/Release/Cassandra.IntegrationTests.dll -labels -exclude=long,duration
+      mono --debug ./testrunner/NUnit.Runners.2.6.4/tools/nunit-console.exe src/Cassandra.Tests/bin/Release/Cassandra.Tests.dll src/Cassandra.IntegrationTests/bin/Release/Cassandra.IntegrationTests.dll -labels -include=debug
   - nunit:
     - "TestResult.xml"

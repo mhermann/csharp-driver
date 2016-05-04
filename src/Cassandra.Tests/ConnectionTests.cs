@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Text;
@@ -126,6 +127,68 @@ namespace Cassandra.Tests
             buffer = GetResultBuffer(99);
             connection.ReadParse(buffer, buffer.Length);
             CollectionAssert.AreEqual(new short[] { 127, 126, 100, 99 }, streamIds);
+        }
+
+        [Test]
+        public void ReadParse_Handles_UnComplete_Header_In_Multiple_Messages2()
+        {
+            for (var i = 1; i <= 30; i++)
+            {
+                var size = i;
+                Test3Messages(() => size);
+            }
+        }
+
+        [Test]
+        public void ReadParse_Handles_UnComplete_Header_In_Multiple_Messages3()
+        {
+            var rnd = new Random();
+            for (var i = 1; i <= 30; i++)
+            {
+                Test3Messages(() => rnd.Next(1, 40));
+            }
+        }
+
+        private static void Test3Messages(Func<int> getChunkSize)
+        {
+            var streamIdsPending = new Dictionary<int, bool>
+            {
+                { 127, false},
+                { 126, false},
+                { 125, false},
+                { 100, false}
+            };
+            var connectionMock = GetConnectionMock();
+            var streamIds = new List<short>();
+            var responses = new List<Response>();
+            connectionMock.Setup(c => c.RemoveFromPending(It.IsAny<short>()))
+                .Callback<short>(id => streamIds.Add(id))
+                .Returns<short>(id =>
+                {
+                    if (streamIdsPending[id])
+                    {
+                        // it was already yielded
+                        return null;
+                    }
+                    streamIdsPending[id] = true;
+                    return new OperationState((ex, r) => responses.Add(r));
+                });
+            var connection = connectionMock.Object;
+            var buffer = GetResultBuffer(127)
+                .Concat(GetResultBufferWithBody(126))
+                .Concat(GetResultBufferWithBody(125))
+                .Concat(GetResultBuffer(100))
+                .ToArray();
+            var i = 0;
+            while (i < buffer.Length)
+            {
+                var chunkSize = getChunkSize();
+                var b = buffer.Skip(i).Take(chunkSize).ToArray();
+                connection.ReadParse(b, Math.Min(b.Length, chunkSize));
+                i += chunkSize;
+            }
+            CollectionAssert.AreEqual(new short[] { 127, 126, 125, 100 }, streamIds);
+            TestHelper.WaitUntil(() => responses.Count == 4);
         }
 
         [Test]
@@ -270,6 +333,21 @@ namespace Cassandra.Tests
                 0x82, 0, streamId, ResultResponse.OpCode, 0, 0, 0, 4, 
                 //body
                 0, 0, 0, 1
+            };
+        }
+
+        /// <summary>
+        /// Gets a buffer containing 8 bytes for header and 0 bytes for the body.
+        /// For result + void response message  (protocol v2)
+        /// </summary>
+        private static byte[] GetResultBufferWithBody(byte streamId = 0)
+        {
+            return new byte[]
+            {
+                //header
+                0x82, 0, streamId, ResultResponse.OpCode, 0, 0, 0, 21, 
+                //body
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
             };
         }
     }

@@ -29,7 +29,7 @@ using Cassandra.IntegrationTests.Policies.Util;
 
 namespace Cassandra.IntegrationTests.Core
 {
-    [TestFixture, Category("long")]
+    [TestFixture, Category("debug")]
     public class StressTests : TestGlobals
     {
         [TestFixtureSetUp]
@@ -107,6 +107,7 @@ namespace Cassandra.IntegrationTests.Core
             using (var cluster = Cluster.Builder()
                 .WithRetryPolicy(AlwaysRetryRetryPolicy.Instance)
                 .AddContactPoint(testCluster.InitialContactPoint)
+                .WithQueryTimeout(120000)
                 .Build())
             {
                 var session = cluster.Connect();
