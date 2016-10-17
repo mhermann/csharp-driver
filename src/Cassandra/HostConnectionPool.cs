@@ -432,4 +432,192 @@ namespace Cassandra
             _host.Remove -= OnHostRemoved;
         }
     }
+
+    internal class HostConnectionPool2 : IDisposable
+    {
+        private static readonly Logger Logger = new Logger(typeof(HostConnectionPool));
+
+        /// <summary>
+        /// Represents the possible states of the pool.
+        /// Possible state transitions:
+        ///  - From initial to closing: The pool must be closed because the host is ignored.
+        ///  - From initial to shuttingDown: The pool is being shutdown as a result of a client shutdown.
+        ///  - From closing to initial state: The pool finished closing connections (is now ignored) and it resets to
+        ///    initial state in case the host is marked as local/remote in the future.
+        ///  - From closing to shuttingDown (rare): It was marked as ignored, now the client is being shutdown.
+        ///  - From shuttingDown to shutdown: Finished shutting down, the pool should not be reused.
+        /// </summary>
+        private static class PoolState
+        {
+            /// <summary>
+            /// Initial state: open / opening / ready to be opened
+            /// </summary>
+            public const int Init = 0;
+            /// <summary>
+            /// When the pool is being closed as part of a distance change
+            /// </summary>
+            public const int Closing = 1;
+            /// <summary>
+            /// When the pool is being shutdown for good
+            /// </summary>
+            public const int ShuttingDown = 2;
+            /// <summary>
+            /// When the pool has being shutdown
+            /// </summary>
+            public const int Shutdown = 3;
+        }
+
+        private readonly Host _host;
+        private readonly Configuration _config;
+        private readonly Serializer _serializer;
+        private readonly CopyOnWriteList<Connection> _connections = new CopyOnWriteList<Connection>();
+        private readonly HashedWheelTimer _timer;
+        private volatile IReconnectionSchedule _reconnectionSchedule;
+        private int state = PoolState.Init;
+
+        public bool HasConnections
+        {
+            get { return _connections.Count > 0; }
+        }
+
+        public bool IsClosing
+        {
+            get { return Volatile.Read(ref state) != PoolState.Init; }
+        }
+
+        public HostConnectionPool2(Host host, Configuration config, Serializer serializer)
+        {
+            _host = host;
+            _host.Down += OnHostDown;
+            _host.Up += OnHostUp;
+            _host.Remove += OnHostRemoved;
+            _config = config;
+            _serializer = serializer;
+            _timer = config.Timer;
+            _reconnectionSchedule = config.Policies.ReconnectionPolicy.NewSchedule();
+        }
+
+        public Task<Connection> BorrowConnection()
+        {
+            //TODO: Maybe create pool
+            //TODO: Yield the least busy
+            throw new NotImplementedException();
+        }
+
+        /// <exception cref="System.Net.Sockets.SocketException">Throws a SocketException when the connection could not be established with the host</exception>
+        /// <exception cref="AuthenticationException" />
+        /// <exception cref="UnsupportedProtocolVersionException"></exception>
+        internal virtual async Task<Connection> CreateConnection()
+        {
+            Logger.Info("Creating a new connection to the host " + _host.Address);
+            var c = new Connection(_serializer, _host.Address, _config);
+            try
+            {
+                await c.Open().ConfigureAwait(false);
+                if (_config.GetPoolingOptions(_serializer.ProtocolVersion).GetHeartBeatInterval() > 0)
+                {
+                    c.OnIdleRequestException += OnIdleRequestException;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("The connection to {0} could not be opened: {1}", _host.Address, ex);
+                c.Dispose();
+                throw;
+            }
+            return c;
+        }
+
+        /// <summary>
+        /// Releases the resources associated with the pool.
+        /// </summary>
+        public void Dispose()
+        {
+            //TODO:  Shutdown();
+            _host.Up -= OnHostUp;
+            _host.Down -= OnHostDown;
+            _host.Remove -= OnHostRemoved;
+        }
+
+        private void OnHostRemoved()
+        {
+            //TODO: Drain and shutdown
+            throw new NotImplementedException();
+        }
+
+        private void OnHostUp(Host h)
+        {
+            //TODO: Issue an immediate reconnection attempt 
+            throw new NotImplementedException();
+        }
+
+        private void OnHostDown(Host h, long delay)
+        {
+            //TODO: Cancel any reconnection attempt
+            throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Handler that gets invoked when if there is a socket exception when making a heartbeat/idle request
+        /// </summary>
+        private void OnIdleRequestException(Exception ex)
+        {
+            _host.SetDown();
+        }
+
+        //private HashedWheelTimer.ITimeout _newConnectionTimeout;
+        private readonly object _scheduleLock = new object();
+
+        /// <summary>
+        /// Adds a new reconnection timeout using a new schedule.
+        /// </summary>
+        public async Task ScheduleReconnection()
+        {
+            //TODO: Cancel previous timers
+            // if there is a timer, cancel it
+            // if creating a next timer, something changed => exit
+            lock (_scheduleLock)
+            {
+                if (IsClosing)
+                {
+                    // We shouldn't schedule more connection attempts
+                    return;
+                }
+                var schedule = _config.Policies.ReconnectionPolicy.NewSchedule();
+                _reconnectionSchedule = schedule;
+            }
+            var openConnection = false;
+            while (!openConnection)
+            {
+//                try
+//                {
+//                    Logger.Info("Attempting reconnection to host {0}", _host.Address);
+//                    await CreateConnection().ConfigureAwait(false);
+//                    Logger.Info("Reconnection attempt to host {0} succeeded", _host.Address);
+//                    openConnection = true;
+//                }
+//                catch (Exception ex)
+//                {
+//                }
+            }
+        }
+        /*
+         
+                if (t.Status == TaskStatus.RanToCompletion)
+                {
+                    if (_isShuttingDown)
+                    {
+                        t.Result.Dispose();
+                        TransitionCreationTask(tcs, EmptyConnectionsArray);
+                        return;
+                    }
+                    _connections.Add(t.Result);
+                    Logger.Info("Reconnection attempt to host {0} succeeded", _host.Address);
+                    _host.BringUpIfDown();
+                    TransitionCreationTask(tcs, new [] { t.Result });
+                    return;
+                }
+                Logger.Info("Reconnection attempt to host {0} failed", _host.Address);
+         * */
+    }
 }

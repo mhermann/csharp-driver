@@ -49,6 +49,7 @@ namespace Cassandra
         /// It gets raised more frequently than <see cref="Down"/>, as it is raised per each failed reconnection attempt also.
         /// </remarks>
         /// </summary>
+        //TODO: Remove
         internal event Action<Host, long> CheckedAsDown;
         /// <summary>
         /// Event that gets raised when the host is considered back UP (available for queries) by the driver.

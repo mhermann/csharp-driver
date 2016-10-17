@@ -85,6 +85,10 @@ namespace Cassandra
         /// Event that gets raised when a write has been completed. Testing purposes only.
         /// </summary>
         public event Action WriteCompleted;
+        /// <summary>
+        /// Event that gets raised the connection is being closed.
+        /// </summary>
+        public event Action Closing;
         private const string IdleQuery = "SELECT key from system.local";
         private const long CoalescingThreshold = 8000;
 
@@ -272,6 +276,10 @@ namespace Cassandra
             var wasClosed = Interlocked.Exchange(ref _writeState, WriteStateClosed) == WriteStateClosed;
             if (!wasClosed)
             {
+                if (Closing != null)
+                {
+                    Closing();
+                }
                 Logger.Info("Canceling in Connection {0}, {1} pending operations and write queue {2}", Address, Interlocked.Read(ref _inFlight), _writeQueue.Count);
                 if (socketError != null)
                 {
