@@ -88,7 +88,7 @@ namespace Cassandra
         /// <summary>
         /// Event that gets raised the connection is being closed.
         /// </summary>
-        public event Action Closing;
+        public event Action<Connection> Closing;
         private const string IdleQuery = "SELECT key from system.local";
         private const long CoalescingThreshold = 8000;
 
@@ -278,7 +278,7 @@ namespace Cassandra
             {
                 if (Closing != null)
                 {
-                    Closing();
+                    Closing(this);
                 }
                 Logger.Info("Canceling in Connection {0}, {1} pending operations and write queue {2}", Address, Interlocked.Read(ref _inFlight), _writeQueue.Count);
                 if (socketError != null)
