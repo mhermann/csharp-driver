@@ -519,8 +519,9 @@ namespace Cassandra
         /// </summary>
         public void Dispose()
         {
+            // Mark as shuttingDown (once?)
             //TODO:  Shutdown();
-            //TODO
+            //TODO: close pool
             _host.Up -= OnHostUp;
             _host.Down -= OnHostDown;
             _host.Remove -= OnHostRemoved;
@@ -554,10 +555,10 @@ namespace Cassandra
             throw new NotImplementedException();
         }
 
-        private void OnHostUp(Host h)
+        public void OnHostUp(Host h)
         {
-            //TODO: Issue an immediate reconnection attempt 
-            throw new NotImplementedException();
+            Logger.Info("Pool #{0} for host {1} attempting to reconnect as host is UP", GetHashCode(), _host.Address);
+            ScheduleReconnection(true);
         }
 
         private void OnHostDown(Host h, long delay)
@@ -597,17 +598,17 @@ namespace Cassandra
         /// Adds a new reconnection timeout using a new schedule.
         /// Resets the status of the pool to allow further reconnections.
         /// </summary>
-        public void ScheduleReconnection()
+        public void ScheduleReconnection(bool immediate = false)
         {
             var schedule = _config.Policies.ReconnectionPolicy.NewSchedule();
             _reconnectionSchedule = schedule;
             Interlocked.Exchange(ref _state, PoolState.Init);
-            SetNewConnectionTimeout(schedule);
+            SetNewConnectionTimeout(immediate ? null : schedule);
         }
 
         private void SetNewConnectionTimeout(IReconnectionSchedule schedule)
         {
-            if (_reconnectionSchedule != schedule)
+            if (schedule != null && _reconnectionSchedule != schedule)
             {
                 // There's another reconnection schedule, leave it
                 return;
@@ -727,17 +728,17 @@ namespace Cassandra
             }
             if (IsClosing)
             {
-                Logger.Info("Connection to {0} opened successfully but pool was being closed", _host.Address);
+                Logger.Info("Connection to {0} opened successfully but pool #{1} was being closed", _host.Address);
                 var ex = GetNotConnectedException();
                 Interlocked.Exchange(ref _connectionOpenTcs, null);
                 c.Dispose();
                 tcs.TrySetException(ex);
                 throw ex;
             }
-            Logger.Info("Connection to {0} opened successfully", _host.Address);
-            _connections.Add(c);
-            Interlocked.Exchange(ref _connectionOpenTcs, null);
+            var newLength = _connections.AddNew(c);
+            Logger.Info("Connection to {0} opened successfully, pool #{1} length: {2}", _host.Address, GetHashCode(), newLength);
             tcs.TrySetResult(c);
+            Interlocked.Exchange(ref _connectionOpenTcs, null);
             return c;
         }
 
@@ -756,7 +757,7 @@ namespace Cassandra
             try
             {
                 var c = await CreateOpenConnection();
-                //TODO: Start growing
+                StartCreatingConnection(null);
                 return new[] {c};
             }
             catch (Exception)

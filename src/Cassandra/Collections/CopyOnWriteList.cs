@@ -35,16 +35,28 @@ namespace Cassandra.Collections
             return GetEnumerator();
         }
 
+        /// <summary>
+        /// Adds a new item to the list
+        /// </summary>
         public void Add(T item)
+        {
+            AddNew(item);
+        }
+
+        /// <summary>
+        /// Adds a new item to the list and returns the new length
+        /// </summary>
+        public int AddNew(T item)
         {
             lock (_writeLock)
             {
                 var currentArray = _array;
                 var newArray = new T[currentArray.Length + 1];
                 currentArray.CopyTo(newArray, 0);
-                //Add the new item at the end
+                // Add the item at the end
                 newArray[currentArray.Length] = item;
                 _array = newArray;
+                return newArray.Length;
             }
         }
 

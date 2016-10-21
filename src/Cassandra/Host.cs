@@ -22,8 +22,7 @@ using System.Threading;
 namespace Cassandra
 {
     /// <summary>
-    ///  A Cassandra node. This class keeps the informations the driver maintain on a
-    ///  given Cassandra node.
+    ///  A Cassandra node. This class keeps the information the driver maintains on a given Cassandra node.
     /// </summary>
     public class Host
     {
