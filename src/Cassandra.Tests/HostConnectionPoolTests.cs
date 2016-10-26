@@ -27,6 +27,7 @@ namespace Cassandra.Tests
         public void OnTimeSetUp()
         {
             Diagnostics.CassandraTraceSwitch.Level = TraceLevel.Info;
+            Trace.Listeners.Add(new ConsoleTraceListener());
         }
 
         [OneTimeTearDown]
@@ -117,7 +118,7 @@ namespace Cassandra.Tests
             creation.Wait();
             Assert.AreEqual(1, creation.Result.Length);
             //yield the third connection first
-            CollectionAssert.AreEqual(new[] {GetIpEndPoint()}, creation.Result.Select(c => c.Address));
+            CollectionAssert.AreEqual(new[] { GetIpEndPoint() }, creation.Result.Select(c => c.Address));
         }
 
         [Test]
@@ -148,10 +149,10 @@ namespace Cassandra.Tests
             var lastByte = 1;
             mock.Setup(p => p.DoCreateAndOpen()).Returns(() =>
             {
-                var c = CreateConnection((byte) lastByte++);
+                var c = CreateConnection((byte)lastByte++);
                 if (lastByte == 2)
                 {
-                    return TestHelper.DelayedTask(c, 500);   
+                    return TestHelper.DelayedTask(c, 500);
                 }
                 return TaskHelper.ToTask(c);
             });
@@ -166,7 +167,7 @@ namespace Cassandra.Tests
             Assert.AreEqual(1, TaskHelper.WaitToComplete(creationTasks[0]).Length);
             for (var i = 1; i < creationTasks.Length; i++)
             {
-                Assert.AreEqual(1, TaskHelper.WaitToComplete(creationTasks[i]).Length);   
+                Assert.AreEqual(1, TaskHelper.WaitToComplete(creationTasks[i]).Length);
             }
         }
 
@@ -243,9 +244,57 @@ namespace Cassandra.Tests
         }
 
         [Test]
-        public void EnsureCreate_After_Reconnection_Attempt_Waits_Existing()
+        public async Task EnsureCreate_After_Reconnection_Attempt_Waits_Existing()
         {
-            throw new NotImplementedException();
+            var mock = GetPoolMock(null, GetConfig(2, 2));
+            var creationCounter = 0;
+            var isCreating = 0;
+            mock.Setup(p => p.DoCreateAndOpen()).Returns(() =>
+            {
+                Interlocked.Increment(ref creationCounter);
+                Interlocked.Exchange(ref isCreating, 1);
+                return TestHelper.DelayedTask(CreateConnection(), 300, () => Interlocked.Exchange(ref isCreating, 0));
+            });
+            var pool = mock.Object;
+            pool.SetDistance(HostDistance.Local);
+            Assert.AreEqual(0, pool.OpenConnections);
+            Thread.Sleep(100);
+            pool.OnHostUp(null);
+            await pool.EnsureCreate();
+            Assert.AreEqual(1, pool.OpenConnections);
+            Thread.Sleep(1000);
+            Assert.AreEqual(2, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(2, pool.OpenConnections);
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
+        }
+
+        [Test]
+        public async Task EnsureCreate_Can_Handle_Multiple_Concurrent_Calls()
+        {
+            var mock = GetPoolMock(null, GetConfig(3, 3));
+            var creationCounter = 0;
+            var isCreating = 0;
+            mock.Setup(p => p.DoCreateAndOpen()).Returns(() =>
+            {
+                Interlocked.Increment(ref creationCounter);
+                Interlocked.Exchange(ref isCreating, 1);
+                return TestHelper.DelayedTask(CreateConnection(), 50, () => Interlocked.Exchange(ref isCreating, 0));
+            });
+            var pool = mock.Object;
+            pool.SetDistance(HostDistance.Local);
+            Assert.AreEqual(0, pool.OpenConnections);
+            var tasks = new Task[100];
+            for (var i = 0; i < 100; i++)
+            {
+                tasks[i] = Task.Run(async () => await pool.EnsureCreate());
+            }
+            await Task.WhenAll(tasks);
+            Assert.Greater(pool.OpenConnections, 0);
+            Assert.LessOrEqual(pool.OpenConnections, 3);
+            await Task.Delay(400);
+            Assert.AreEqual(3, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
+            Assert.AreEqual(3, pool.OpenConnections);
         }
 
         [Test]
@@ -275,40 +324,40 @@ namespace Cassandra.Tests
             Thread.Sleep(500);
             Assert.AreEqual(3, pool.OpenConnections);
             Assert.AreEqual(0, Volatile.Read(ref isCreating));
-            Assert.AreEqual(3, pool.OpenConnections);
+            Assert.AreEqual(3, Volatile.Read(ref creationCounter));
             Thread.Sleep(500);
-            Assert.AreEqual(0, Volatile.Read(ref isCreating));
             Assert.AreEqual(3, pool.OpenConnections);
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
             Assert.AreEqual(3, Volatile.Read(ref creationCounter));
         }
 
         [Test]
         public void EnsureCreate_Should_Increase_One_At_A_Time_Until_Max_Connections()
         {
-//            var mock = GetPoolMock(null, GetConfig(1, 3));
-//            mock.Setup(p => p.CreateConnection()).Returns(() => TestHelper.DelayedTask(CreateConnection(1, GetConfig(1, 3)), 200));
-//            var pool = mock.Object;
-//            pool.MaybeCreateFirstConnection().Wait(1000);
-//            Assert.AreEqual(1, pool.OpenConnections.Count());
-//            //inflight is low
-//            var creatingNew = pool.MaybeIncreasePoolSize(0);
-//            Assert.False(creatingNew);
-//            Assert.AreEqual(1, pool.OpenConnections.Count());
-//            Thread.Sleep(500);
-//            Assert.AreEqual(1, pool.OpenConnections.Count());
-//            creatingNew = pool.MaybeIncreasePoolSize(128);
-//            Assert.True(creatingNew);
-//            Thread.Sleep(500);
-//            Assert.AreEqual(2, pool.OpenConnections.Count());
-//            creatingNew = pool.MaybeIncreasePoolSize(128);
-//            Assert.True(creatingNew);
-//            Thread.Sleep(500);
-//            Assert.AreEqual(3, pool.OpenConnections.Count());
-//            creatingNew = pool.MaybeIncreasePoolSize(128);
-//            Assert.False(creatingNew);
-//            Thread.Sleep(500);
-//            //Still max
-//            Assert.AreEqual(3, pool.OpenConnections.Count());
+            //            var mock = GetPoolMock(null, GetConfig(1, 3));
+            //            mock.Setup(p => p.CreateConnection()).Returns(() => TestHelper.DelayedTask(CreateConnection(1, GetConfig(1, 3)), 200));
+            //            var pool = mock.Object;
+            //            pool.MaybeCreateFirstConnection().Wait(1000);
+            //            Assert.AreEqual(1, pool.OpenConnections.Count());
+            //            //inflight is low
+            //            var creatingNew = pool.MaybeIncreasePoolSize(0);
+            //            Assert.False(creatingNew);
+            //            Assert.AreEqual(1, pool.OpenConnections.Count());
+            //            Thread.Sleep(500);
+            //            Assert.AreEqual(1, pool.OpenConnections.Count());
+            //            creatingNew = pool.MaybeIncreasePoolSize(128);
+            //            Assert.True(creatingNew);
+            //            Thread.Sleep(500);
+            //            Assert.AreEqual(2, pool.OpenConnections.Count());
+            //            creatingNew = pool.MaybeIncreasePoolSize(128);
+            //            Assert.True(creatingNew);
+            //            Thread.Sleep(500);
+            //            Assert.AreEqual(3, pool.OpenConnections.Count());
+            //            creatingNew = pool.MaybeIncreasePoolSize(128);
+            //            Assert.False(creatingNew);
+            //            Thread.Sleep(500);
+            //            //Still max
+            //            Assert.AreEqual(3, pool.OpenConnections.Count());
         }
 
         [Test]

@@ -529,16 +529,21 @@ namespace Cassandra
 
         private void OnConnectionClosing(Connection c = null)
         {
+            int currentLength;
             if (c != null)
             {
-                _connections.Remove(c);
+                currentLength = _connections.RemoveAndCount(c).Item2;
             }
-            if (IsClosing || _connections.Count >= _coreConnectionLength)
+            else
+            {
+                currentLength = _connections.Count;
+            }
+            if (IsClosing || currentLength >= _coreConnectionLength)
             {
                 // No need to reconnect
                 return;
             }
-            if (_connections.Count == 0)
+            if (currentLength == 0)
             {
                 if (AllConnectionClosed != null)
                 {
@@ -621,8 +626,8 @@ namespace Cassandra
             }
             else
             {
-                // Start creating immediately on another thread
-                Task.Run(() => StartCreatingConnection(null));
+                // Start creating immediately
+                StartCreatingConnection(null);
             }
             var previousTimeout = Interlocked.Exchange(ref _newConnectionTimeout, timeout);
             if (previousTimeout != null)
@@ -696,21 +701,42 @@ namespace Cassandra
         /// Opens one connection. 
         /// If a connection is being opened it yields the same task, preventing creation in parallel.
         /// </summary>
-        /// <exception cref="System.Net.Sockets.SocketException">Throws a SocketException when the connection could not be established with the host</exception>
+        /// <exception cref="SocketException">Throws a SocketException when the connection could not be established with the host</exception>
         /// <exception cref="AuthenticationException" />
         /// <exception cref="UnsupportedProtocolVersionException"></exception>
         public async Task<Connection> CreateOpenConnection()
         {
-            var tcs = new TaskCompletionSource<Connection>();
-            var concurrentOpenTcs = Interlocked.CompareExchange(ref _connectionOpenTcs, tcs, null);
+            var concurrentOpenTcs = Volatile.Read(ref _connectionOpenTcs);
+            // Try to exit early (cheap) as there could be another thread creating / finishing creating
             if (concurrentOpenTcs != null)
             {
                 // There is another thread opening a new connection
-                return await concurrentOpenTcs.Task;
+                return await concurrentOpenTcs.Task.ConfigureAwait(false);
+            }
+            var tcs = new TaskCompletionSource<Connection>();
+            // Try to set the creation task source
+            concurrentOpenTcs = Interlocked.CompareExchange(ref _connectionOpenTcs, tcs, null);
+            if (concurrentOpenTcs != null)
+            {
+                // There is another thread opening a new connection
+                return await concurrentOpenTcs.Task.ConfigureAwait(false);
             }
             if (IsClosing)
             {
-                throw GetNotConnectedException();
+                return await FinishOpen(tcs, GetNotConnectedException()).ConfigureAwait(false);
+            }
+            // Before creating, make sure that its still needed
+            // This method is the only one that adds new connections
+            // But we don't control the removal, use snapshot
+            var connectionsSnapshot = _connections.GetSnapshot();
+            if (connectionsSnapshot.Length >= _coreConnectionLength)
+            {
+                if (connectionsSnapshot.Length == 0)
+                {
+                    // Avoid race condition while removing
+                    return await FinishOpen(tcs, GetNotConnectedException()).ConfigureAwait(false);
+                }
+                return await FinishOpen(tcs, null, connectionsSnapshot[0]).ConfigureAwait(false);
             }
             Logger.Info("Creating a new connection to {0}", _host.Address);
             Connection c;
@@ -721,25 +747,34 @@ namespace Cassandra
             catch (Exception ex)
             {
                 Logger.Info("Connection to {0} could not be created: {1}", _host.Address, ex);
-                tcs.TrySetException(ex);
-                // Clean the internal state to allow other threads to create a connection
-                Interlocked.Exchange(ref _connectionOpenTcs, null);
+                // Can not await on catch on C# 5..
+                FinishOpen(tcs, ex).ConfigureAwait(false);
                 throw;
             }
             if (IsClosing)
             {
                 Logger.Info("Connection to {0} opened successfully but pool #{1} was being closed", _host.Address);
-                var ex = GetNotConnectedException();
-                Interlocked.Exchange(ref _connectionOpenTcs, null);
                 c.Dispose();
-                tcs.TrySetException(ex);
-                throw ex;
+                return await FinishOpen(tcs, GetNotConnectedException()).ConfigureAwait(false);
             }
             var newLength = _connections.AddNew(c);
-            Logger.Info("Connection to {0} opened successfully, pool #{1} length: {2}", _host.Address, GetHashCode(), newLength);
-            tcs.TrySetResult(c);
+            Logger.Info("Connection to {0} opened successfully, pool #{1} length: {2}", 
+                _host.Address, GetHashCode(), newLength);
+            return await FinishOpen(tcs, null, c).ConfigureAwait(false);
+        }
+
+        private Task<Connection> FinishOpen(TaskCompletionSource<Connection> tcs, Exception ex, Connection c = null)
+        {
             Interlocked.Exchange(ref _connectionOpenTcs, null);
-            return c;
+            if (ex != null)
+            {
+                tcs.TrySetException(ex);
+            }
+            else
+            {
+                tcs.TrySetResult(c);
+            }
+            return tcs.Task;
         }
 
         private static SocketException GetNotConnectedException()
@@ -747,18 +782,22 @@ namespace Cassandra
             return new SocketException((int)SocketError.NotConnected);
         }
 
+        /// <summary>
+        /// Ensures that the pool has at least contains 1 connection to the host.
+        /// </summary>
         public async Task<Connection[]> EnsureCreate()
         {
             var connections = _connections.GetSnapshot();
             if (connections.Length > 0)
             {
+                // Use snapshot to return as early as possible
                 return connections;
             }
             try
             {
-                var c = await CreateOpenConnection();
+                var c = await CreateOpenConnection().ConfigureAwait(false);
                 StartCreatingConnection(null);
-                return new[] {c};
+                return new[] { c };
             }
             catch (Exception)
             {
@@ -779,12 +818,19 @@ namespace Cassandra
         /// </summary>
         public async Task<Connection> BorrowConnection()
         {
-            var connections = await EnsureCreate();
+            var connections = await EnsureCreate().ConfigureAwait(false);
             if (connections.Length == 0)
             {
                 return null;
             }
-            return MinInFlight(connections, ref _connectionIndex);
+            var c = MinInFlight(connections, ref _connectionIndex);
+            ConsiderResizingPool(c.InFlight);
+            return c;
+        }
+
+        private void ConsiderResizingPool(int inFlight)
+        {
+            //TODO
         }
 
         /// <summary>
