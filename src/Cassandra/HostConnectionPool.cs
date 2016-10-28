@@ -437,7 +437,8 @@ namespace Cassandra
     internal class HostConnectionPool2 : IDisposable
     {
         private static readonly Logger Logger = new Logger(typeof(HostConnectionPool));
-        private const int ConnectionIndexOverflow = int.MaxValue - 100000;
+        private const int ConnectionIndexOverflow = int.MaxValue - 1000000;
+        private const long BetweenResizeDelay = 2000;
 
         /// <summary>
         /// Represents the possible states of the pool.
@@ -477,8 +478,11 @@ namespace Cassandra
         private readonly CopyOnWriteList<Connection> _connections = new CopyOnWriteList<Connection>();
         private readonly HashedWheelTimer _timer;
         private volatile IReconnectionSchedule _reconnectionSchedule;
-        private volatile int _coreConnectionLength;
-        //TODO: private volatile int _maxConnectionLength;
+        private volatile int _expectedConnectionLength;
+        private volatile int _maxInflightThreshold;
+        private volatile int _maxConnectionLength;
+        private volatile HashedWheelTimer.ITimeout _resizingEndTimeout;
+        private int _poolResizing;
         private int _state = PoolState.Init;
         private HashedWheelTimer.ITimeout _newConnectionTimeout;
         private TaskCompletionSource<Connection> _connectionOpenTcs;
@@ -511,7 +515,100 @@ namespace Cassandra
             _serializer = serializer;
             _timer = config.Timer;
             _reconnectionSchedule = config.Policies.ReconnectionPolicy.NewSchedule();
-            _coreConnectionLength = 1;
+            _expectedConnectionLength = 1;
+        }
+
+        /// <summary>
+        /// Gets an open connection from the host pool (creating if necessary).
+        /// It returns null if the load balancing policy didn't allow connections to this host.
+        /// </summary>
+        public async Task<Connection> BorrowConnection()
+        {
+            var connections = await EnsureCreate().ConfigureAwait(false);
+            if (connections.Length == 0)
+            {
+                return null;
+            }
+            var c = MinInFlight(connections, ref _connectionIndex, _maxInflightThreshold);
+            ConsiderResizingPool(c.InFlight);
+            return c;
+        }
+
+        public void ConsiderResizingPool(int inFlight)
+        {
+            if (inFlight < _maxInflightThreshold)
+            {
+                // The requests in-flight are normal
+                return;
+            }
+            if (_expectedConnectionLength >= _maxConnectionLength)
+            {
+                // We can not add more connections
+                return;
+            }
+            if (_connections.Count < _expectedConnectionLength)
+            {
+                // The pool is still trying to acquire the correct size
+                return;
+            }
+            var canResize = Interlocked.Exchange(ref _poolResizing, 1) == 0;
+            if (!canResize)
+            {
+                // There is already another thread resizing the pool
+                return;
+            }
+            _expectedConnectionLength++;
+            Logger.Info("Increasing pool #{0} size to {1}, as in-flight requests are above threshold ({2})", 
+                GetHashCode(), _expectedConnectionLength, _maxInflightThreshold);
+            StartCreatingConnection(null);
+            _resizingEndTimeout = _timer.NewTimeout(_ => Interlocked.Exchange(ref _poolResizing, 0), null, BetweenResizeDelay);
+        }
+
+        /// <summary>
+        /// Gets the connection with the minimum number of InFlight requests.
+        /// Only checks for index + 1 and index, to avoid a loop of all connections.
+        /// </summary>
+        /// <param name="connections">A snapshot of the pool of connections</param>
+        /// <param name="connectionIndex">Current round-robin index</param>
+        /// <param name="inFlightThreshold">
+        /// The max amount of in-flight requests that cause this method to continue
+        /// iterating until finding the connection with min number of in-flight requests.
+        /// </param>
+        public static Connection MinInFlight(Connection[] connections, ref int connectionIndex, int inFlightThreshold)
+        {
+            if (connections.Length == 1)
+            {
+                return connections[0];
+            }
+            //It is very likely that the amount of InFlight requests per connection is the same
+            //Do round robin between connections, skipping connections that have more in flight requests
+            var index = Interlocked.Increment(ref connectionIndex);
+            if (index > ConnectionIndexOverflow)
+            {
+                //Overflow protection, not exactly thread-safe but we can live with it
+                Interlocked.Exchange(ref connectionIndex, 0);
+            }
+            Connection c = null;
+            for (var i = index; i < index + connections.Length; i++)
+            {
+                c = connections[i % connections.Length];
+                var previousConnection = connections[(i - 1) % connections.Length];
+                // Avoid multiple volatile reads
+                var inFlight = c.InFlight;
+                var previousInFlight = previousConnection.InFlight;
+                if (previousInFlight < inFlight)
+                {
+                    c = previousConnection;
+                    inFlight = previousInFlight;
+                }
+                if (inFlight < inFlightThreshold)
+                {
+                    // We should avoid traversing all the connections
+                    // We have a connection with a decent amount of in-flight requests
+                    break;
+                }
+            }
+            return c;
         }
 
         /// <summary>
@@ -522,9 +619,34 @@ namespace Cassandra
             // Mark as shuttingDown (once?)
             //TODO:  Shutdown();
             //TODO: close pool
+            var t = _resizingEndTimeout;
+            if (t != null)
+            {
+                t.Cancel();
+            }
             _host.Up -= OnHostUp;
             _host.Down -= OnHostDown;
             _host.Remove -= OnHostRemoved;
+        }
+
+        public virtual async Task<Connection> DoCreateAndOpen()
+        {
+            var c = new Connection(_serializer, _host.Address, _config);
+            try
+            {
+                await c.Open().ConfigureAwait(false);
+            }
+            catch
+            {
+                c.Dispose();
+                throw;
+            }
+            if (_config.GetPoolingOptions(_serializer.ProtocolVersion).GetHeartBeatInterval() > 0)
+            {
+                c.OnIdleRequestException += OnIdleRequestException;
+            }
+            c.Closing += OnConnectionClosing;
+            return c;
         }
 
         private void OnConnectionClosing(Connection c = null)
@@ -538,7 +660,7 @@ namespace Cassandra
             {
                 currentLength = _connections.Count;
             }
-            if (IsClosing || currentLength >= _coreConnectionLength)
+            if (IsClosing || currentLength >= _expectedConnectionLength)
             {
                 // No need to reconnect
                 return;
@@ -585,6 +707,7 @@ namespace Cassandra
         /// </summary>
         public void StartClosing()
         {
+            //TODO
             var isClosing = Interlocked.CompareExchange(ref _state, PoolState.Closing, PoolState.Init) == PoolState.Init;
             if (!isClosing)
             {
@@ -644,7 +767,7 @@ namespace Cassandra
         /// <param name="schedule"></param>
         private void StartCreatingConnection(IReconnectionSchedule schedule)
         {
-            if (_connections.Count >= _coreConnectionLength)
+            if (_connections.Count >= _expectedConnectionLength)
             {
                 return;
             }
@@ -675,26 +798,6 @@ namespace Cassandra
                 }
                 OnConnectionClosing();
             }, TaskContinuationOptions.ExecuteSynchronously);
-        }
-
-        public virtual async Task<Connection> DoCreateAndOpen()
-        {
-            var c = new Connection(_serializer, _host.Address, _config);
-            try
-            {
-                await c.Open().ConfigureAwait(false);
-            }
-            catch
-            {
-                c.Dispose();
-                throw;
-            }
-            if (_config.GetPoolingOptions(_serializer.ProtocolVersion).GetHeartBeatInterval() > 0)
-            {
-                c.OnIdleRequestException += OnIdleRequestException;
-            }
-            c.Closing += OnConnectionClosing;
-            return c;
         }
 
         /// <summary>
@@ -729,7 +832,7 @@ namespace Cassandra
             // This method is the only one that adds new connections
             // But we don't control the removal, use snapshot
             var connectionsSnapshot = _connections.GetSnapshot();
-            if (connectionsSnapshot.Length >= _coreConnectionLength)
+            if (connectionsSnapshot.Length >= _expectedConnectionLength)
             {
                 if (connectionsSnapshot.Length == 0)
                 {
@@ -808,56 +911,10 @@ namespace Cassandra
 
         public void SetDistance(HostDistance distance)
         {
-            _coreConnectionLength = _config.GetPoolingOptions(_serializer.ProtocolVersion).GetCoreConnectionsPerHost(distance);
-            //TODO: _maxConnectionLength = _config.GetPoolingOptions(_serializer.ProtocolVersion).GetMaxConnectionPerHost(distance);
-        }
-
-        /// <summary>
-        /// Gets an open connection from the host pool (creating if necessary).
-        /// It returns null if the load balancing policy didn't allow connections to this host.
-        /// </summary>
-        public async Task<Connection> BorrowConnection()
-        {
-            var connections = await EnsureCreate().ConfigureAwait(false);
-            if (connections.Length == 0)
-            {
-                return null;
-            }
-            var c = MinInFlight(connections, ref _connectionIndex);
-            ConsiderResizingPool(c.InFlight);
-            return c;
-        }
-
-        private void ConsiderResizingPool(int inFlight)
-        {
-            //TODO
-        }
-
-        /// <summary>
-        /// Gets the connection with the minimum number of InFlight requests.
-        /// Only checks for index + 1 and index, to avoid a loop of all connections.
-        /// </summary>
-        public static Connection MinInFlight(Connection[] connections, ref int connectionIndex)
-        {
-            if (connections.Length == 1)
-            {
-                return connections[0];
-            }
-            //It is very likely that the amount of InFlight requests per connection is the same
-            //Do round robin between connections, skipping connections that have more in flight requests
-            var index = Interlocked.Increment(ref connectionIndex);
-            if (index > ConnectionIndexOverflow)
-            {
-                //Overflow protection, not exactly thread-safe but we can live with it
-                Interlocked.Exchange(ref connectionIndex, 0);
-            }
-            var currentConnection = connections[index % connections.Length];
-            var previousConnection = connections[(index - 1) % connections.Length];
-            if (previousConnection.InFlight < currentConnection.InFlight)
-            {
-                return previousConnection;
-            }
-            return currentConnection;
+            var poolingOptions = _config.GetPoolingOptions(_serializer.ProtocolVersion);
+            _expectedConnectionLength = poolingOptions.GetCoreConnectionsPerHost(distance);
+            _maxInflightThreshold =  poolingOptions.GetMaxSimultaneousRequestsPerConnectionTreshold(distance);
+            _maxConnectionLength = poolingOptions.GetMaxConnectionPerHost(distance);
         }
     }
 }

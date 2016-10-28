@@ -67,6 +67,7 @@ namespace Cassandra.Tests
         {
             var pooling = new PoolingOptions()
                 .SetCoreConnectionsPerHost(HostDistance.Local, coreConnections)
+                .SetMaxSimultaneousRequestsPerConnectionTreshold(HostDistance.Local, 1500)
                 .SetMaxConnectionsPerHost(HostDistance.Local, maxConnections);
             var policies = new Policies(
                 Policies.DefaultLoadBalancingPolicy,
@@ -332,32 +333,55 @@ namespace Cassandra.Tests
         }
 
         [Test]
-        public void EnsureCreate_Should_Increase_One_At_A_Time_Until_Max_Connections()
+        public async Task ConsiderResizingPool_Should_Increase_One_At_A_Time_Until_Max_Connections()
         {
-            //            var mock = GetPoolMock(null, GetConfig(1, 3));
-            //            mock.Setup(p => p.CreateConnection()).Returns(() => TestHelper.DelayedTask(CreateConnection(1, GetConfig(1, 3)), 200));
-            //            var pool = mock.Object;
-            //            pool.MaybeCreateFirstConnection().Wait(1000);
-            //            Assert.AreEqual(1, pool.OpenConnections.Count());
-            //            //inflight is low
-            //            var creatingNew = pool.MaybeIncreasePoolSize(0);
-            //            Assert.False(creatingNew);
-            //            Assert.AreEqual(1, pool.OpenConnections.Count());
-            //            Thread.Sleep(500);
-            //            Assert.AreEqual(1, pool.OpenConnections.Count());
-            //            creatingNew = pool.MaybeIncreasePoolSize(128);
-            //            Assert.True(creatingNew);
-            //            Thread.Sleep(500);
-            //            Assert.AreEqual(2, pool.OpenConnections.Count());
-            //            creatingNew = pool.MaybeIncreasePoolSize(128);
-            //            Assert.True(creatingNew);
-            //            Thread.Sleep(500);
-            //            Assert.AreEqual(3, pool.OpenConnections.Count());
-            //            creatingNew = pool.MaybeIncreasePoolSize(128);
-            //            Assert.False(creatingNew);
-            //            Thread.Sleep(500);
-            //            //Still max
-            //            Assert.AreEqual(3, pool.OpenConnections.Count());
+            var mock = GetPoolMock(null, GetConfig(1, 3));
+            var creationCounter = 0;
+            var isCreating = 0;
+            mock.Setup(p => p.DoCreateAndOpen()).Returns(() =>
+            {
+                Interlocked.Increment(ref creationCounter);
+                Interlocked.Exchange(ref isCreating, 1);
+                return TestHelper.DelayedTask(CreateConnection(), 50, () => Interlocked.Exchange(ref isCreating, 0));
+            });
+            var pool = mock.Object;
+            pool.SetDistance(HostDistance.Local);
+            await pool.EnsureCreate();
+            // Low in-flight
+            pool.ConsiderResizingPool(20);
+            Assert.AreEqual(1, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
+            // Above threshold
+            pool.ConsiderResizingPool(1501);
+            Assert.AreEqual(2, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(1, Volatile.Read(ref isCreating));
+            // Wait for the creation
+            await Task.Delay(100);
+            Assert.AreEqual(2, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
+            // Wait for the connection pool to allow further connections
+            await Task.Delay(2100);
+            // Below threshold
+            pool.ConsiderResizingPool(20);
+            Assert.AreEqual(2, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
+            // Above threshold
+            pool.ConsiderResizingPool(1700);
+            Assert.AreEqual(3, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(1, Volatile.Read(ref isCreating));
+            // Wait for the creation
+            await Task.Delay(100);
+            Assert.AreEqual(3, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
+            // Wait for the connection pool to allow further connections
+            await Task.Delay(2100);
+            Assert.AreEqual(3, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
+            // Reached max: above threshold
+            pool.ConsiderResizingPool(1700);
+            // Still max
+            Assert.AreEqual(3, Volatile.Read(ref creationCounter));
+            Assert.AreEqual(0, Volatile.Read(ref isCreating));
         }
 
         [Test]
@@ -369,28 +393,49 @@ namespace Cassandra.Tests
                 GetConnectionMock(1),
                 GetConnectionMock(1),
                 GetConnectionMock(10),
-                GetConnectionMock(1),
+                GetConnectionMock(1)
             };
             var index = 1;
-            var c = HostConnectionPool.MinInFlight(connections, ref index);
+            var c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
             Assert.AreEqual(index, 2);
             Assert.AreSame(connections[2], c);
-            c = HostConnectionPool.MinInFlight(connections, ref index);
+            c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
             Assert.AreEqual(index, 3);
             //previous had less in flight
             Assert.AreSame(connections[2], c);
-            c = HostConnectionPool.MinInFlight(connections, ref index);
+            c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
             Assert.AreEqual(index, 4);
             Assert.AreSame(connections[4], c);
-            c = HostConnectionPool.MinInFlight(connections, ref index);
+            c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
             Assert.AreEqual(index, 5);
             Assert.AreSame(connections[0], c);
-            c = HostConnectionPool.MinInFlight(connections, ref index);
+            c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
             Assert.AreEqual(index, 6);
             Assert.AreSame(connections[0], c);
             index = 9;
-            c = HostConnectionPool.MinInFlight(connections, ref index);
+            c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
             Assert.AreEqual(index, 10);
+            Assert.AreSame(connections[0], c);
+        }
+
+        [Test]
+        public void MinInFlight_Goes_Through_All_The_Connections_When_Over_Threshold()
+        {
+            var connections = new[]
+            {
+                GetConnectionMock(10),
+                GetConnectionMock(1),
+                GetConnectionMock(201),
+                GetConnectionMock(200),
+                GetConnectionMock(210)
+            };
+            var index = 1;
+            var c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
+            Assert.AreEqual(index, 2);
+            Assert.AreSame(connections[1], c);
+            c = HostConnectionPool2.MinInFlight(connections, ref index, 100);
+            Assert.AreEqual(index, 3);
+            // Should pick the first below the threshold
             Assert.AreSame(connections[0], c);
         }
 
